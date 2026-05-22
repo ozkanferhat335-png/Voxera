@@ -1,0 +1,47 @@
+# Build stage
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+
+# Copy project files
+COPY ["src/Voxera.API/Voxera.API.csproj", "src/Voxera.API/"]
+COPY ["src/Voxera.Application/Voxera.Application.csproj", "src/Voxera.Application/"]
+COPY ["src/Voxera.Domain/Voxera.Domain.csproj", "src/Voxera.Domain/"]
+COPY ["src/Voxera.Infrastructure/Voxera.Infrastructure.csproj", "src/Voxera.Infrastructure/"]
+
+# Restore dependencies
+RUN dotnet restore "src/Voxera.API/Voxera.API.csproj"
+
+# Copy source code
+COPY src/ src/
+
+# Build
+RUN dotnet build "src/Voxera.API/Voxera.API.csproj" -c Release -o /app/build
+
+# Publish
+FROM build AS publish
+RUN dotnet publish "src/Voxera.API/Voxera.API.csproj" -c Release -o /app/publish /p:UseAppHost=false
+
+# Runtime stage
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
+WORKDIR /app
+
+# Install curl for healthcheck
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN addgroup --system --gid 1001 voxera && \
+    adduser --system --uid 1001 --ingroup voxera voxera
+
+# Create directories
+RUN mkdir -p /app/logs /var/recordings && \
+    chown -R voxera:voxera /app /var/recordings
+
+COPY --from=publish --chown=voxera:voxera /app/publish .
+
+USER voxera
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+ENTRYPOINT ["dotnet", "Voxera.API.dll"]
