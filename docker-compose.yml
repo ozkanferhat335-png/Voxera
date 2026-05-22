@@ -1,0 +1,229 @@
+version: '3.9'
+
+services:
+  # ============================================================
+  # PostgreSQL Database
+  # ============================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: voxera-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: voxera
+      POSTGRES_USER: voxera
+      POSTGRES_PASSWORD: voxera_pass
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/db/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - voxera-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voxera -d voxera"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # Redis Cache
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: voxera-redis
+    restart: unless-stopped
+    command: redis-server --requirepass voxera_redis_pass --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - voxera-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "voxera_redis_pass", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # RabbitMQ Message Queue
+  # ============================================================
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: voxera-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: voxera
+      RABBITMQ_DEFAULT_PASS: voxera_pass
+      RABBITMQ_DEFAULT_VHOST: /
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"  # Management UI
+    networks:
+      - voxera-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ============================================================
+  # FreeSWITCH VoIP Engine
+  # ============================================================
+  freeswitch:
+    image: signalwire/freeswitch:latest
+    container_name: voxera-freeswitch
+    restart: unless-stopped
+    network_mode: host  # Required for SIP/RTP
+    volumes:
+      - ./deploy/freeswitch/conf:/etc/freeswitch
+      - freeswitch_recordings:/var/recordings
+      - freeswitch_logs:/var/log/freeswitch
+    environment:
+      - FREESWITCH_DOMAIN=sip.voxera.io
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # ============================================================
+  # Kamailio SIP Proxy
+  # ============================================================
+  kamailio:
+    image: kamailio/kamailio:5.7-alpine
+    container_name: voxera-kamailio
+    restart: unless-stopped
+    network_mode: host  # Required for SIP
+    volumes:
+      - ./deploy/kamailio:/etc/kamailio
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - KAMAILIO_DOMAIN=sip.voxera.io
+      - DB_HOST=localhost
+      - DB_NAME=voxera
+      - DB_USER=voxera
+      - DB_PASS=voxera_pass
+
+  # ============================================================
+  # ASP.NET Core API
+  # ============================================================
+  api:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.api
+    container_name: voxera-api
+    restart: unless-stopped
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:5000
+      - ConnectionStrings__DefaultConnection=Host=postgres;Port=5432;Database=voxera;Username=voxera;Password=voxera_pass
+      - Jwt__SecretKey=${JWT_SECRET_KEY}
+      - Redis__ConnectionString=redis:6379,password=voxera_redis_pass
+      - RabbitMQ__Host=rabbitmq
+      - FreeSWITCH__Host=freeswitch
+    volumes:
+      - freeswitch_recordings:/var/recordings:ro
+      - api_logs:/app/logs
+    ports:
+      - "5000:5000"
+    networks:
+      - voxera-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================
+  # Background Worker
+  # ============================================================
+  worker:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.worker
+    container_name: voxera-worker
+    restart: unless-stopped
+    environment:
+      - DOTNET_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=postgres;Port=5432;Database=voxera;Username=voxera;Password=voxera_pass
+      - Redis__ConnectionString=redis:6379,password=voxera_redis_pass
+      - RabbitMQ__Host=rabbitmq
+      - AI__OpenAiApiKey=${OPENAI_API_KEY}
+    volumes:
+      - freeswitch_recordings:/var/recordings
+    networks:
+      - voxera-net
+    depends_on:
+      - api
+
+  # ============================================================
+  # React Web Panel
+  # ============================================================
+  webpanel:
+    build:
+      context: ./src/Voxera.WebPanel
+      dockerfile: Dockerfile
+    container_name: voxera-webpanel
+    restart: unless-stopped
+    environment:
+      - REACT_APP_API_URL=https://api.voxera.io
+      - REACT_APP_WS_URL=wss://api.voxera.io
+    ports:
+      - "3000:80"
+    networks:
+      - voxera-net
+    depends_on:
+      - api
+
+  # ============================================================
+  # Nginx Reverse Proxy
+  # ============================================================
+  nginx:
+    image: nginx:alpine
+    container_name: voxera-nginx
+    restart: unless-stopped
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx_certs:/etc/nginx/certs
+      - nginx_logs:/var/log/nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - voxera-net
+    depends_on:
+      - api
+      - webpanel
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  freeswitch_recordings:
+  freeswitch_logs:
+  api_logs:
+  nginx_certs:
+  nginx_logs:
+
+networks:
+  voxera-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

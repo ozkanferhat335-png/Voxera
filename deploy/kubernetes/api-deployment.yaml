@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voxera-api
+  namespace: voxera
+  labels:
+    app: voxera-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: voxera-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: voxera-api
+    spec:
+      containers:
+        - name: api
+          image: voxera/api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 5000
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+            - name: ASPNETCORE_URLS
+              value: "http://+:5000"
+            - name: ConnectionStrings__DefaultConnection
+              valueFrom:
+                secretKeyRef:
+                  name: voxera-secrets
+                  key: db-connection-string
+            - name: Jwt__SecretKey
+              valueFrom:
+                secretKeyRef:
+                  name: voxera-secrets
+                  key: jwt-secret-key
+            - name: Redis__ConnectionString
+              valueFrom:
+                secretKeyRef:
+                  name: voxera-secrets
+                  key: redis-connection-string
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: recordings
+              mountPath: /var/recordings
+      volumes:
+        - name: recordings
+          persistentVolumeClaim:
+            claimName: recordings-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voxera-api-svc
+  namespace: voxera
+spec:
+  selector:
+    app: voxera-api
+  ports:
+    - port: 5000
+      targetPort: 5000
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: voxera-api-hpa
+  namespace: voxera
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: voxera-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
